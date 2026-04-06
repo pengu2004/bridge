@@ -2,7 +2,9 @@
 
 ## Overview
 
-A system that provides terminal access to your files from any mobile device, with bidirectional sync between your laptop and a remote server, using local storage on the device for performance.
+A system that provides terminal access to your files from any mobile device, with bidirectional sync between your laptop and a remote server.
+
+Terminal as primary interface = simpler than building a file browser UI.
 
 ## Architecture
 
@@ -10,144 +12,313 @@ A system that provides terminal access to your files from any mobile device, wit
 ┌─────────────────────────────────────────────────────────────────┐
 │                           S3 BUCKET                              │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │  s3://my-sync-bucket/                                   │   │
+│  │  s3://bridge-bucket/                                   │   │
 │  │  ├── home/                                              │   │
-│  │  │   └── ubuntu/                                        │   │
+│  │  │   └── {user_id}/                                    │   │
 │  │  │       ├── documents/                                 │   │
 │  │  │       ├── projects/                                  │   │
 │  │  │       └── .ssh/                                      │   │
-│  │  └── .config/                                           │   │
-│  │      └── user-settings.json                             │   │
+│  │  └── .manifest/                                         │   │
+│  │      └── {user_id}.json                                 │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
-                              ▲
-                              │ Delta sync
-                              │
+                               ▲
+                               │ S3 SDK (direct API)
+                               │
 ┌─────────────────────────────────────────────────────────────────┐
 │                         AWS EC2 (t3.micro)                      │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐    │
-│  │  WebSocket   │   │  PTY Process │   │  Redis Cache    │    │
-│  │  Server      │◄──│  (bash)      │   │  (dir listings) │    │
-│  └──────────────┘   └──────────────┘   └──────────────────┘    │
+│  ┌──────────────────────┐   ┌──────────────────────────────┐  │
+│  │  WebSocket Server     │   │  PTY Process                 │  │
+│  │  + S3 SDK             │◄──│  (bash shell)               │  │
+│  │  (no s3fs, no redis)  │   │                              │  │
+│  └──────────────────────┘   └──────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
          ▲
          │ WebSocket
          │
 ┌─────────────────────────────────────────────────────────────────┐
 │                    React Native App                              │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐    │
-│  │  Local       │   │  SQLite/     │   │  Command        │    │
-│  │  Terminal    │   │  Dexie.js    │   │  Queue          │    │
-│  │  Emulator    │   │  (metadata)  │   │  (offline)      │    │
-│  └──────────────┘   └──────────────┘   └──────────────────┘    │
+│  ┌──────────────────┐   ┌──────────────────┐                   │
+│  │  xterm.js        │   │  Local Cache     │                   │
+│  │  (terminal)      │   │  (SQLite)        │                   │
+│  └──────────────────┘   └──────────────────┘                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+## Why Terminal?
+
+| File Browser | Terminal |
+|--------------|----------|
+| Custom directory listing UI | `ls` (already exists) |
+| Custom file preview (images, docs, code) | `cat`, `vim` |
+| Custom git UI | `git` |
+| Custom search UI | `grep`, `find` |
+| Custom editor | `vim`, `nano` |
+| **Every feature = new component** | **Delegate to CLI tools** |
+
+Terminal-as-primary = **simpler to build**.
 
 ## Tech Stack
 
 ### Backend (EC2)
 - **Runtime**: Node.js 18+
-- **WebSocket**: ws or socket.io
-- **PTY**: node-pty (spawns real bash shells)
-- **Session Management**: tmux/screen (persist across reconnects)
-- **Cache**: Redis (directory listings)
-- **Storage**: S3 via AWS SDK
+- **WebSocket**: ws
+- **PTY**: node-pty (spawns bash shells)
+- **Storage**: AWS SDK v3 (S3)
 - **Process Manager**: PM2
+- **No Redis, No S3FS**
 
 ### Mobile App
 - **Framework**: React Native
 - **Terminal**: xterm.js (via WebView)
-- **Local Storage**: SQLite (Dexie.js) for metadata cache
-- **File Cache**: File system for recent file contents
-- **HTTP Client**: Axios
-- **WebSocket**: Native WebSocket API
+- **Local Storage**: SQLite (Dexie.js)
+- **WebSocket**: Native API
+
+### Laptop (Sync)
+- **Tool**: rclone
+- **No custom sync client needed**
 
 ### Infrastructure
 - **Compute**: AWS EC2 t3.micro
 - **Storage**: AWS S3
 - **Auth**: JWT tokens
-- **Networking**: Elastic IP + Security Groups
 
-## Data Flow
+## How It Works
 
-### Sync Protocol
-
-```javascript
-// On connect
-const sync = async () => {
-  // 1. Get remote manifest (file hashes + modified dates)
-  const remote = await s3.listWithHashes(bucket);
-  
-  // 2. Compare with local manifest
-  const local = await db.getManifest();
-  
-  // 3. Compute delta
-  const toDownload = remote.filter(r => 
-    !local[r.path] || local[r.path].hash !== r.hash
-  );
-  
-  const toUpload = local.filter(l =>
-    !remote[l.path] || remote[l.path].hash !== l.hash
-  );
-  
-  // 4. Apply delta (background)
-  await Promise.all([
-    downloadFiles(toDownload),
-    uploadFiles(toUpload)
-  ]);
-  
-  // 5. Update local manifest
-  await db.updateManifest(remote);
-};
+### 1. User connects from mobile app
+```
+Mobile App ──WebSocket──> EC2
+                         │
+                         ├── Authenticates (JWT)
+                         └── Spawns PTY (bash shell)
 ```
 
-### Offline Command Queue
+### 2. User runs commands
+```
+User types "ls -la"
+Mobile ──WS──> EC2 PTY
+              │
+              ├── PTY executes command
+              ├── S3 SDK reads directory metadata (cached in memory)
+              └── Output sent back via WebSocket
+```
+
+### 3. File operations work via S3 SDK
+```javascript
+// When command touches a file (cat, vim, etc.)
+// Backend intercepts and uses S3 SDK
+
+async function readFile(path) {
+  const key = `home/${userId}/${path}`;
+  const response = await s3.getObject({ Bucket: 'bridge-bucket', Key: key });
+  return response.Body.transformToString();
+}
+
+async function writeFile(path, content) {
+  const key = `home/${userId}/${path}`;
+  await s3.putObject({ Bucket: 'bridge-bucket', Key: key, Body: content });
+}
+
+// Shell's cwd maps to S3 prefix
+// /home/user/projects/  →  s3://bridge/home/{user}/projects/
+```
+
+### 4. Laptop sync via rclone
+```bash
+# One-time setup
+rclone config
+# Choose S3, enter credentials
+
+# Sync commands
+rclone sync ~/projects s3:bridge-bucket/home/{user}/projects/
+```
+
+## Backend Implementation
+
+### S3 Service (Backend)
 
 ```javascript
-const queue = {
-  add: (cmd) => db.pendingCommands.add(cmd),
-  flush: async () => {
-    while (cmd = await db.pendingCommands.shift()) {
-      await execute(cmd);
-      await sync();
-    }
+// src/s3.js
+const { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+
+const s3 = new S3Client({ region: 'us-east-1' });
+const BUCKET = 'bridge-bucket';
+
+class S3Service {
+  constructor(userId) {
+    this.userId = userId;
+    this.prefix = `home/${userId}/`;
+    this.cache = new Map(); // In-memory cache
   }
-};
+
+  async list(path = '') {
+    const key = this.prefix + path;
+    const command = new ListObjectsV2Command({
+      Bucket: BUCKET,
+      Prefix: key,
+      Delimiter: '/'
+    });
+    
+    const response = await s3.send(command);
+    return {
+      files: (response.Contents || []).map(obj => ({
+        name: obj.Key.replace(key, '').replace(this.prefix + path, ''),
+        size: obj.Size,
+        modified: obj.LastModified
+      })),
+      directories: (response.CommonPrefixes || []).map(p => ({
+        name: p.Prefix.replace(key, '').replace('/', '')
+      }))
+    };
+  }
+
+  async read(key) {
+    if (this.cache.has(key)) {
+      return this.cache.get(key);
+    }
+    
+    const fullKey = this.prefix + key;
+    const command = new GetObjectCommand({ Bucket: BUCKET, Key: fullKey });
+    const response = await s3.send(command);
+    const content = await response.Body.transformToString();
+    
+    this.cache.set(key, content);
+    return content;
+  }
+
+  async write(key, content) {
+    const fullKey = this.prefix + key;
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: fullKey,
+      Body: content
+    }));
+    this.cache.set(key, content);
+  }
+}
+
+module.exports = S3Service;
 ```
 
-### Terminal Flow (Optimized)
+### PTY Handler (Backend)
 
+```javascript
+// src/pty.js
+const pty = require('node-pty');
+const S3Service = require('./s3');
+
+class PtyManager {
+  constructor(ws, userId) {
+    this.ws = ws;
+    this.s3 = new S3Service(userId);
+    this.cwd = `/home/${userId}`;
+    
+    this.pty = pty.spawn('bash', [], {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 24,
+      cwd: this.cwd,
+      env: process.env
+    });
+
+    this.pty.onData(data => {
+      ws.send(JSON.stringify({ type: 'output', data }));
+    });
+
+    this.pty.onExit(() => {
+      ws.send(JSON.stringify({ type: 'exit' }));
+    });
+  }
+
+  handleCommand(input) {
+    // Intercept file commands
+    const cmd = input.trim();
+    
+    if (cmd.startsWith('cat ')) {
+      const file = cmd.slice(4);
+      this.s3.read(file).then(content => {
+        this.pty.write(content + '\r');
+      });
+      return;
+    }
+
+    if (cmd === 'ls' || cmd.startsWith('ls ')) {
+      const path = cmd.slice(3) || '';
+      this.s3.list(path).then(result => {
+        const output = result.directories.map(d => d.name + '/').join('  ') + '\n' +
+                       result.files.map(f => f.name).join('  ');
+        this.pty.write(output + '\r');
+      });
+      return;
+    }
+
+    if (cmd.startsWith('echo ') && cmd.includes('>')) {
+      const [content, file] = cmd.split('>').map(s => s.trim());
+      const text = content.replace(/^echo /, '').replace(/"/g, '');
+      this.s3.write(file, text).then(() => {
+        this.pty.write('\r');
+      });
+      return;
+    }
+
+    // Pass through to shell
+    this.pty.write(input);
+  }
+
+  resize(cols, rows) {
+    this.pty.resize(cols, rows);
+  }
+
+  kill() {
+    this.pty.kill();
+  }
+}
+
+module.exports = PtyManager;
 ```
-User types "ls projects/"
-│
-├─ Mobile: Query local SQLite → 5ms response
-│          Shows cached directory listing
-│
-├─ Background: Check S3 for changes since last sync
-│              Compare file hashes
-│              Download only changed files
-│
-└─ UI: Subtle "syncing..." indicator, file counts
+
+### WebSocket Server (Backend)
+
+```javascript
+// src/index.js
+const WebSocket = require('ws');
+const PtyManager = require('./pty');
+const jwt = require('jsonwebtoken');
+
+const wss = new WebSocket.Server({ port: 8080 });
+
+const sessions = new Map(); // userId -> PtyManager
+
+wss.on('connection', (ws, req) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  
+  try {
+    const { userId } = jwt.verify(token, process.env.JWT_SECRET);
+    
+    const pty = new PtyManager(ws, userId);
+    sessions.set(userId, pty);
+
+    ws.on('message', (msg) => {
+      const { type, data, cols, rows } = JSON.parse(msg);
+      
+      if (type === 'input') {
+        pty.handleCommand(data);
+      }
+      if (type === 'resize') {
+        pty.resize(cols, rows);
+      }
+    });
+
+    ws.on('close', () => {
+      pty.kill();
+      sessions.delete(userId);
+    });
+
+  } catch (err) {
+    ws.close(4001, 'Unauthorized');
+  }
+});
 ```
-
-## Performance
-
-### Optimized vs Unoptimized
-
-| Operation | Optimized | Unoptimized |
-|-----------|-----------|-------------|
-| ls (100 files) | 5ms | 500ms |
-| cat (small file) | 2ms | 300ms |
-| ls again (same dir) | 1ms | 500ms |
-| Edit file offline | Instant | N/A |
-
-### Key Optimizations
-
-1. **Local Terminal Echo**: Show characters immediately, don't wait for server
-2. **SQLite Metadata Cache**: Directory listings stored locally
-3. **File Content Cache**: Recently accessed files cached on device
-4. **Delta Sync**: Only transfer changed files
-5. **Redis on Server**: Cache S3 listings for faster directory access
 
 ## AWS Resources
 
@@ -159,10 +330,11 @@ s3://bridge-bucket/
 │   └── {user_id}/
 │       ├── documents/
 │       ├── projects/
+│       │   ├── index.js
+│       │   └── package.json
 │       └── .ssh/
-└── .sync/
-    └── manifests/
-        └── {user_id}.json
+└── .manifest/
+    └── {user_id}.json
 ```
 
 ### IAM Policy for EC2
@@ -186,23 +358,46 @@ s3://bridge-bucket/
 }
 ```
 
-### EC2 Setup
+### EC2 Setup (Simplified)
 
 ```bash
-# Install dependencies
+# Install dependencies only
 sudo apt update
-sudo apt install -y nodejs npm redis-server s3fs tmux
+sudo apt install -y nodejs npm
 
-# Mount S3 (fstab entry)
-s3fs#bridge-bucket /mnt/s3 -o use_cache=/tmp/s3fs,_netdev,allow_other
+# No s3fs, no redis
 
-# S3FS optimizations
-s3fs bucket /mnt/s3 \
-  -o use_cache=/tmp/s3fs \
-  -o max_stat_cache_size=10000 \
-  -o stat_cache_expire=900 \
-  -o multipart_size=52 \
-  -o parallel_count=10
+# Deploy
+git clone https://github.com/your-user/bridge.git
+cd bridge/backend
+npm install
+pm2 start src/index.js
+```
+
+## Laptop Sync
+
+```bash
+# Install rclone
+brew install rclone  # macOS
+# or: curl https://rclone.org/install.sh | sudo bash
+
+# Configure once
+rclone config
+# Choose: s3
+# Provider: AWS
+# Access Key: xxx
+# Secret Key: xxx
+# Region: us-east-1
+# Name: bridge-s3
+
+# Sync up (laptop → S3)
+rclone sync ~/projects bridge-s3:bridge-bucket/home/{user}/projects/ -v
+
+# Sync down (S3 → laptop)
+rclone sync bridge-s3:bridge-bucket/home/{user}/projects/ ~/projects -v
+
+# Or use rclone mount for live access (experimental)
+rclone mount bridge-s3:bridge-bucket /mnt/bridge --vfs-cache-mode writes
 ```
 
 ## Security
@@ -210,85 +405,51 @@ s3fs bucket /mnt/s3 \
 ### Authentication Flow
 
 1. User enters credentials in mobile app
-2. App sends credentials to EC2 via HTTPS
-3. EC2 validates against stored hash (or Cognito)
-4. Returns JWT token (expires in 24h)
-5. All subsequent WebSocket connections include JWT
-6. JWT verified on each connection
+2. App sends to `/api/auth/login` on EC2
+3. Server validates, returns JWT (24h expiry)
+4. All WebSocket connections include JWT header
+5. Server verifies JWT, extracts userId
 
 ### Security Considerations
 
-- S3 credentials on EC2 via IAM role (not hardcoded)
-- Terminal sessions authenticated
-- JWT tokens with short expiry
-- Security groups restrict access to necessary ports only
-- No filesystem-level encryption (relies on S3 encryption)
+- IAM role on EC2 (no credentials in code)
+- JWT with short expiry
+- Security groups: only port 8080 (WS) + 443 (HTTPS)
+- No filesystem access (all via S3 SDK)
 
 ## Tradeoffs
 
 ### Advantages
 
-1. **Cost-effective**: t3.micro ~$5-10/month + S3 at $0.023/GB
-2. **Offline-capable**: Local cache allows work without connection
-3. **Fast UI**: Local-first design feels instant
-4. **Cross-platform**: Works from any device with browser/app
-5. **Persistent storage**: S3 is always available
+1. **Simple backend**: No S3FS, no Redis, just Node.js + S3 SDK
+2. **Cost-effective**: t3.micro + S3 at $0.023/GB
+3. **Terminal simplicity**: Built-in CLI tools for all file operations
+4. **Laptop sync**: rclone handles sync (battle-tested)
 
 ### Disadvantages
 
-1. **S3FS latency**: 50-200ms per operation vs 0.1ms local
-2. **Sync complexity**: Conflicts need resolution strategy
-3. **Network dependency**: Still requires internet for sync
-4. **EC2 maintenance**: Security patches, disk space management
-5. **Terminal UX**: Mobile terminal is never as good as desktop
+1. **No offline on mobile**: Always requires EC2 connection
+2. **Latency**: Every file op hits S3 via EC2
+3. **Shell complexity**: Intercepting commands is fragile
+4. **Terminal UX**: Small screen, no keyboard on mobile
 
-### User Experience Concerns
+### Mitigations
 
-| Concern | Mitigation |
-|---------|------------|
-| EC2 boot time | Keep EC2 always on (~$5/mo) |
-| Terminal lag | Local echo, optimistic updates |
-| File sync conflicts | Last-write-wins default, git-style merge option |
-| Connection drops | tmux persists sessions, auto-reconnect |
-| S3FS hangs | Watchdog scripts, local cache fallback |
-
-## Conflict Resolution
-
-| Scenario | Resolution |
-|----------|------------|
-| Edit on phone, edit on laptop | Last-write-wins by default |
-| Edit on phone, delete on laptop | Phone edit wins (restore from trash) |
-| Edit both within seconds | Prompt user to choose |
-| Advanced mode | Git-style conflict markers |
-
-## Future Improvements
-
-1. **Git integration**: Automatic commits, branches, merges
-2. **Real-time collaboration**: Multiple users in same session
-3. **Video streaming**: For GUI applications
-4. **Lambda functions**: Serverless sync processing
-5. **CloudFront CDN**: For faster file access globally
+| Issue | Solution |
+|-------|----------|
+| Latency | Cache recent file reads in memory |
+| Offline | Skip for MVP (mobile always online anyway) |
+| Shell intercept | Only intercept common commands (cat, ls), pass rest through |
 
 ## Cost Estimate
 
 | Resource | Monthly Cost |
 |----------|--------------|
-| EC2 t3.micro | $5-10 (free on new account) |
+| EC2 t3.micro | ~$5 (always on) or $0 (free tier) |
 | S3 storage (50GB) | $1.15 |
-| S3 transfer (10GB) | $0.90 |
-| EIP (if always-on) | $3.60 |
-| **Total** | **$10-15/month** |
-
-## Getting Started
-
-1. Create AWS account with t3.micro free tier
-2. Create S3 bucket with appropriate IAM policy
-3. Launch EC2 with IAM role for S3 access
-4. Install Node.js, Redis, tmux on EC2
-5. Deploy WebSocket server
-6. Mount S3 bucket on EC2
-7. Install React Native app
-8. Configure connection to EC2 IP
+| S3 requests | ~$0.50 |
+| Data transfer | ~$1 |
+| **Total** | **$7-8/month** |
 
 ## File Structure
 
@@ -298,11 +459,10 @@ bridge/
 │   └── DESIGN.md
 ├── backend/
 │   ├── src/
-│   │   ├── index.js          # Entry point
-│   │   ├── websocket.js      # WebSocket server
-│   │   ├── pty.js            # PTY management
-│   │   ├── sync.js           # S3 sync logic
-│   │   └── auth.js           # JWT authentication
+│   │   ├── index.js          # WebSocket server
+│   │   ├── pty.js           # PTY + shell interception
+│   │   ├── s3.js            # S3 SDK wrapper
+│   │   └── auth.js          # JWT handling
 │   ├── package.json
 │   └── Dockerfile
 ├── mobile/
@@ -310,15 +470,46 @@ bridge/
 │   │   ├── App.tsx
 │   │   ├── components/
 │   │   │   └── Terminal.tsx
-│   │   ├── services/
-│   │   │   ├── websocket.ts
-│   │   │   └── sync.ts
-│   │   └── store/
-│   │       └── db.ts         # Dexie.js SQLite
+│   │   └── services/
+│   │       └── websocket.ts
 │   └── package.json
-├── terraform/
-│   ├── main.tf
-│   ├── variables.tf
-│   └── outputs.tf
+├── laptop/
+│   └── sync.sh              # rclone wrapper script
 └── README.md
 ```
+
+## Getting Started
+
+### Backend
+```bash
+cd backend
+npm install
+# Set AWS_REGION, JWT_SECRET env vars
+pm2 start src/index.js
+```
+
+### Mobile
+```bash
+cd mobile
+npm install
+npm start
+```
+
+### Laptop
+```bash
+# Install rclone
+brew install rclone
+
+# Configure S3
+rclone config
+
+# Add to ~/.zshrc
+alias bridge-sync="rclone sync ~/projects bridge-s3:bridge-bucket/home/your-user/projects/"
+```
+
+## Future Improvements
+
+1. **Better shell integration**: Full PTY pass-through with S3FS-like interception
+2. **Git integration**: Automatic git operations via S3
+3. **Mobile caching**: SQLite on phone for offline file access
+4. **Better terminal UX**: Larger touch targets, swipe gestures

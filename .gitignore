@@ -1,0 +1,55 @@
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Xcode
+*.xcuserstate
+*.xcworkspace
+!*.xcworkspace/contents.xcworkspacedata
+**/*.xcuserstate
+**/DerivedData/
+**/*.hmap
+**/*.ipa
+
+# Swift Package Manager
+.swiftpm/
+
+# React Native
+node_modules/
+.expo/
+dist/
+npm-debug.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
+# iOS
+ios/build/
+ios/Pods/
+ios/*.xcworkspace
+
+# Android
+android/.gradle/
+android/app/build/
+android/build/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Build outputs
+*.app
+*.ipa
+*.apk
+*.aab
+
+# Bridge specific
+.bridge/
+*.bridge.sock
